@@ -53,6 +53,10 @@ class H2StreamMetadataDict(TypedDict):
     # Flag to keep track whether the server has closed the stream
     stream_closed_server: bool
 
+    # While establishing a tunnel via CONNECT, the actual request is sent as trailers
+    # to the proxy after receiving a 200
+    trailers_sent: bool
+
 
 class H2ResponseDict(TypedDict):
     # Data received frame by frame from the server is appended

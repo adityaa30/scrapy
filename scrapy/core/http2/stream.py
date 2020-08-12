@@ -18,7 +18,7 @@ from scrapy.core.http2.types import H2ResponseDict, H2StreamMetadataDict
 from scrapy.http import Request
 from scrapy.http.headers import Headers
 from scrapy.responsetypes import responsetypes
-from scrapy.utils.python import to_bytes
+from scrapy.utils.python import to_bytes, to_unicode
 
 if TYPE_CHECKING:
     from scrapy.core.http2.protocol import H2ClientProtocol
@@ -92,7 +92,7 @@ def _parse_request(request: Request) -> Tuple:
         # The ":scheme" and ":path" pseudo-header fields MUST be omitted in CONNECT method
         # (refer RFC 7540 - Section 8.3)
         method = 'CONNECT'
-        scheme, path = '', ''
+        # scheme, path = None, None
         authority = to_bytes(proxy_host, encoding='ascii') + b':' + to_bytes(str(proxy_port))
 
     return method, authority, scheme, path
@@ -137,6 +137,7 @@ class Stream:
             'remaining_content_length': 0 if self._request.body is None else len(self._request.body),
             'stream_closed_local': False,
             'stream_closed_server': False,
+            'trailers_sent': False
         }
 
         # Private variable used to build the response
@@ -207,25 +208,19 @@ class Stream:
         # OPTIONS request for an "http" or "https" URI that does not include
         # a path component; these MUST include a ":path" pseudo-header field
         # with a value of '*' (refer RFC 7540 - Section 8.1.2.3)
-        if method != 'CONNECT' and not path:
+        if not path:
             path = '*' if self._request.method == 'OPTIONS' else '/'
 
         # Make sure pseudo-headers comes before all the other headers
         headers = [
             (':method', method),
             (':authority', authority),
+            (':scheme', scheme),
+            (':path', path),
         ]
 
-        # The ":scheme" and ":path" pseudo-header fields MUST
-        # be omitted for CONNECT method (refer RFC 7540 - Section 8.3)
-        if method != 'CONNECT':
-            headers += [
-                (':scheme', scheme),
-                (':path', path),
-            ]
-
         for name, value in self._request.headers.items():
-            headers.append((str(name, 'utf-8'), str(value[0], 'utf-8')))
+            headers.append((to_unicode(name), to_unicode(value[0])))
 
         if b'Content-Length' not in self._request.headers.keys():
             headers.append(('Content-Length', str(len(self._request.body))))
