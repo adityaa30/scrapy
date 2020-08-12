@@ -1,21 +1,24 @@
 import logging
+import warnings
 from enum import Enum
 from io import BytesIO
 from typing import List, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse
 
 from h2.errors import ErrorCodes
-from h2.exceptions import H2Error, StreamClosedError
+from h2.exceptions import H2Error, StreamClosedError, ProtocolError
 from hpack import HeaderTuple
 from twisted.internet.defer import Deferred, CancelledError
 from twisted.internet.error import ConnectionClosed
 from twisted.python.failure import Failure
 from twisted.web.client import ResponseFailed
 
-from scrapy.core.http2.types import H2ResponseDict
+from scrapy.core.downloader.webclient import _parse as parse_url
+from scrapy.core.http2.types import H2ResponseDict, H2StreamMetadataDict
 from scrapy.http import Request
 from scrapy.http.headers import Headers
 from scrapy.responsetypes import responsetypes
+from scrapy.utils.python import to_bytes
 
 if TYPE_CHECKING:
     from scrapy.core.http2.protocol import H2ClientProtocol
@@ -68,6 +71,33 @@ class StreamCloseReason(Enum):
     INVALID_HOSTNAME = 7
 
 
+def _parse_request(request: Request) -> Tuple:
+    scheme, netloc, host, port, path = parse_url(request.url)
+
+    method = request.method
+    authority = netloc
+    scheme = scheme
+    path = path
+
+    proxy = request.meta.get('proxy')
+    if proxy:
+        _, _, proxy_host, proxy_port, proxy_params = parse_url(proxy)
+        omit_connect_tunnel = b'noconnect' in proxy_params
+        if omit_connect_tunnel:
+            warnings.warn("Using HTTPS proxies in the noconnect mode is not supported by the "
+                          "downloader handler. If you use Crawlera, it doesn't require this "
+                          "mode anymore, so you should update scrapy-crawlera to 1.3.0+ "
+                          "and remove '?noconnect' from the Crawlera URL.")
+
+        # The ":scheme" and ":path" pseudo-header fields MUST be omitted in CONNECT method
+        # (refer RFC 7540 - Section 8.3)
+        method = 'CONNECT'
+        scheme, path = '', ''
+        authority = to_bytes(proxy_host, encoding='ascii') + b':' + to_bytes(str(proxy_port))
+
+    return method, authority, scheme, path
+
+
 class Stream:
     """Represents a single HTTP/2 Stream.
 
@@ -100,24 +130,14 @@ class Stream:
         self._download_maxsize = self._request.meta.get('download_maxsize', download_maxsize)
         self._download_warnsize = self._request.meta.get('download_warnsize', download_warnsize)
 
-        self.request_start_time = None
-
-        self.content_length = 0 if self._request.body is None else len(self._request.body)
-
-        # Flag to keep track whether this stream has initiated the request
-        self.request_sent = False
-
-        # Flag to track whether we have logged about exceeding download warnsize
-        self._reached_warnsize = False
-
-        # Each time we send a data frame, we will decrease value by the amount send.
-        self.remaining_content_length = self.content_length
-
-        # Flag to keep track whether we have closed this stream
-        self.stream_closed_local = False
-
-        # Flag to keep track whether the server has closed the stream
-        self.stream_closed_server = False
+        self.metadata: H2StreamMetadataDict = {
+            'request_content_length': 0 if self._request.body is None else len(self._request.body),
+            'request_sent': False,
+            'reached_warnsize': False,
+            'remaining_content_length': 0 if self._request.body is None else len(self._request.body),
+            'stream_closed_local': False,
+            'stream_closed_server': False,
+        }
 
         # Private variable used to build the response
         # this response is then converted to appropriate Response class
@@ -132,7 +152,7 @@ class Stream:
             # Close this stream as gracefully as possible
             # If the associated request is initiated we reset this stream
             # else we directly call close() method
-            if self.request_sent:
+            if self.metadata['request_sent']:
                 self.reset_stream(StreamCloseReason.CANCELLED)
             else:
                 self.close(StreamCloseReason.CANCELLED)
@@ -160,7 +180,7 @@ class Stream:
                 self._response['flow_controlled_size'] > self._download_warnsize
                 or content_length_header > self._download_warnsize
             )
-            and not self._reached_warnsize
+            and not self.metadata['reached_warnsize']
         )
 
     def get_response(self) -> Deferred:
@@ -179,11 +199,7 @@ class Stream:
         )
 
     def _get_request_headers(self) -> List[Tuple[str, str]]:
-        url = urlparse(self._request.url)
-
-        path = url.path
-        if url.query:
-            path += '?' + url.query
+        method, authority, scheme, path = _parse_request(request=self._request)
 
         # This pseudo-header field MUST NOT be empty for "http" or "https"
         # URIs; "http" or "https" URIs that do not contain a path component
@@ -191,20 +207,20 @@ class Stream:
         # OPTIONS request for an "http" or "https" URI that does not include
         # a path component; these MUST include a ":path" pseudo-header field
         # with a value of '*' (refer RFC 7540 - Section 8.1.2.3)
-        if not path:
+        if method != 'CONNECT' and not path:
             path = '*' if self._request.method == 'OPTIONS' else '/'
 
         # Make sure pseudo-headers comes before all the other headers
         headers = [
-            (':method', self._request.method),
-            (':authority', url.netloc),
+            (':method', method),
+            (':authority', authority),
         ]
 
         # The ":scheme" and ":path" pseudo-header fields MUST
         # be omitted for CONNECT method (refer RFC 7540 - Section 8.3)
-        if self._request.method != 'CONNECT':
+        if method != 'CONNECT':
             headers += [
-                (':scheme', self._protocol.metadata['uri'].scheme),
+                (':scheme', scheme),
                 (':path', path),
             ]
 
@@ -220,7 +236,7 @@ class Stream:
         if self.check_request_url():
             headers = self._get_request_headers()
             self._protocol.conn.send_headers(self.stream_id, headers, end_stream=False)
-            self.request_sent = True
+            self.metadata['request_sent'] = True
             self.send_data()
         else:
             # Close this stream calling the response errback
@@ -238,7 +254,7 @@ class Stream:
             and has initiated request already by sending HEADER frame. If not then
             stream will raise ProtocolError (raise by h2 state machine).
          """
-        if self.stream_closed_local:
+        if self.metadata['stream_closed_local']:
             raise StreamClosedError(self.stream_id)
 
         # Firstly, check what the flow control window is for current stream.
@@ -249,24 +265,24 @@ class Stream:
 
         # We will send no more than the window size or the remaining file size
         # of data in this call, whichever is smaller.
-        bytes_to_send_size = min(window_size, self.remaining_content_length)
+        bytes_to_send_size = min(window_size, self.metadata['remaining_content_length'])
 
         # We now need to send a number of data frames.
         while bytes_to_send_size > 0:
             chunk_size = min(bytes_to_send_size, max_frame_size)
 
-            data_chunk_start_id = self.content_length - self.remaining_content_length
+            data_chunk_start_id = self.metadata['request_content_length'] - self.metadata['remaining_content_length']
             data_chunk = self._request.body[data_chunk_start_id:data_chunk_start_id + chunk_size]
 
             self._protocol.conn.send_data(self.stream_id, data_chunk, end_stream=False)
 
             bytes_to_send_size = bytes_to_send_size - chunk_size
-            self.remaining_content_length = self.remaining_content_length - chunk_size
+            self.metadata['remaining_content_length'] = self.metadata['remaining_content_length'] - chunk_size
 
-        self.remaining_content_length = max(0, self.remaining_content_length)
+        self.metadata['remaining_content_length'] = max(0, self.metadata['remaining_content_length'])
 
         # End the stream if no more data needs to be send
-        if self.remaining_content_length == 0:
+        if self.metadata['remaining_content_length'] == 0:
             self._protocol.conn.end_stream(self.stream_id)
 
         # Q. What about the rest of the data?
@@ -277,7 +293,8 @@ class Stream:
         Send data that earlier could not be sent as we were
         blocked behind the flow control.
         """
-        if self.remaining_content_length and not self.stream_closed_server and self.request_sent:
+        if self.metadata['remaining_content_length'] and not self.metadata['stream_closed_server'] and \
+            self.metadata['request_sent']:
             self.send_data()
 
     def receive_data(self, data: bytes, flow_controlled_length: int) -> None:
@@ -290,7 +307,7 @@ class Stream:
             return
 
         if self._log_warnsize:
-            self._reached_warnsize = True
+            self.metadata['reached_warnsize'] = True
             warning_msg = (
                 f'Received more ({self._response["flow_controlled_size"]}) bytes than download '
                 f'warn size ({self._download_warnsize}) in request {self._request}'
@@ -314,7 +331,7 @@ class Stream:
             return
 
         if self._log_warnsize:
-            self._reached_warnsize = True
+            self.metadata['reached_warnsize'] = True
             warning_msg = (
                 f'Expected response size ({expected_size}) larger than '
                 f'download warn size ({self._download_warnsize}) in request {self._request}'
@@ -323,18 +340,18 @@ class Stream:
 
     def reset_stream(self, reason: StreamCloseReason = StreamCloseReason.RESET) -> None:
         """Close this stream by sending a RST_FRAME to the remote peer"""
-        if self.stream_closed_local:
+        if self.metadata['stream_closed_local']:
             raise StreamClosedError(self.stream_id)
 
         # Clear buffer earlier to avoid keeping data in memory for a long time
         self._response['body'].truncate(0)
 
-        self.stream_closed_local = True
+        self.metadata['stream_closed_local'] = True
         self._protocol.conn.reset_stream(self.stream_id, ErrorCodes.REFUSED_STREAM)
         self.close(reason)
 
     def _is_data_lost(self) -> bool:
-        assert self.stream_closed_server
+        assert self.metadata['stream_closed_server']
 
         expected_size = self._response['flow_controlled_size']
         received_body_size = int(self._response['headers'][b'Content-Length'])
@@ -349,7 +366,7 @@ class Stream:
     ) -> None:
         """Based on the reason sent we will handle each case.
         """
-        if self.stream_closed_server:
+        if self.metadata['stream_closed_server']:
             raise StreamClosedError(self.stream_id)
 
         if not isinstance(reason, StreamCloseReason):
@@ -362,7 +379,7 @@ class Stream:
         if not from_protocol:
             self._protocol.pop_stream(self.stream_id)
 
-        self.stream_closed_server = True
+        self.metadata['stream_closed_server'] = True
 
         # We do not check for Content-Length or Transfer-Encoding in response headers
         # and add `partial` flag as in HTTP/1.1 as 'A request or response that includes
@@ -402,7 +419,10 @@ class Stream:
 
         elif reason is StreamCloseReason.RESET:
             self._deferred_response.errback(ResponseFailed([
-                Failure(f'Remote peer {self._protocol.metadata["ip_address"]} sent RST_STREAM')
+                Failure(
+                    f'Remote peer {self._protocol.metadata["ip_address"]} sent RST_STREAM',
+                    ProtocolError
+                )
             ]))
 
         elif reason is StreamCloseReason.CONNECTION_LOST:

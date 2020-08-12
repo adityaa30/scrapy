@@ -118,13 +118,21 @@ class H2Agent:
         self._reactor = reactor
         self._pool = pool
         self._context_factory = AcceptableProtocolsContextFactory(context_factory, acceptable_protocols=[b'h2'])
-        self.endpoint_factory = _StandardEndpointFactory(
+        self._endpoint_factory = _StandardEndpointFactory(
             self._reactor, self._context_factory,
             connect_timeout, bind_address
         )
 
+    @property
+    def context_factory(self):
+        return self._context_factory
+
+    @property
+    def endpoint_factory(self):
+        return self._endpoint_factory
+
     def get_endpoint(self, uri: URI):
-        return self.endpoint_factory.endpointForURI(uri)
+        return self._endpoint_factory.endpointForURI(uri)
 
     def get_key(self, uri: URI) -> Tuple:
         """

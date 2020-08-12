@@ -1,4 +1,3 @@
-import warnings
 from time import time
 from typing import Optional, Tuple
 from urllib.parse import urldefrag
@@ -9,7 +8,6 @@ from twisted.internet.error import TimeoutError
 from twisted.web.client import BrowserLikePolicyForHTTPS, URI
 
 from scrapy.core.downloader.contextfactory import load_context_factory_from_settings
-from scrapy.core.downloader.webclient import _parse
 from scrapy.core.http2.agent import H2Agent, H2ConnectionPool
 from scrapy.http import Request, Response
 from scrapy.settings import Settings
@@ -86,19 +84,6 @@ class ScrapyH2Agent:
         bind_address = request.meta.get('bindaddress') or self._bind_address
         proxy = request.meta.get('proxy')
         if proxy:
-            _, _, proxy_host, proxy_port, proxy_params = _parse(proxy)
-            scheme = _parse(request.url)[0]
-            proxy_host = proxy_host.decode()
-            omit_connect_tunnel = b'noconnect' in proxy_params
-            if omit_connect_tunnel:
-                warnings.warn("Using HTTPS proxies in the noconnect mode is not supported by the "
-                              "downloader handler. If you use Crawlera, it doesn't require this "
-                              "mode anymore, so you should update scrapy-crawlera to 1.3.0+ "
-                              "and remove '?noconnect' from the Crawlera URL.")
-
-            if scheme == b'https' and not omit_connect_tunnel:
-                # ToDo
-                raise NotImplementedError('Tunneling via CONNECT method using HTTP/2.0 is not yet supported')
             return self._ProxyAgent(
                 reactor=reactor,
                 context_factory=self._context_factory,

@@ -14,6 +14,7 @@ from h2.events import (
     WindowUpdated
 )
 from h2.exceptions import H2Error
+from h2.settings import SettingCodes
 from twisted.internet.defer import Deferred
 from twisted.internet.error import TimeoutError
 from twisted.internet.interfaces import IHandshakeListener, IProtocolNegotiationFactory
@@ -77,6 +78,7 @@ class H2ClientProtocol(Protocol, TimeoutMixin):
 
         config = H2Configuration(client_side=True, header_encoding='utf-8')
         self.conn = H2Connection(config=config)
+        self.conn.local_settings[SettingCodes.ENABLE_CONNECT_PROTOCOL] = 1
 
         # ID of the next request stream
         # Following the convention - 'Streams initiated by a client MUST
@@ -145,7 +147,6 @@ class H2ClientProtocol(Protocol, TimeoutMixin):
             self._active_streams += 1
             stream = self._pending_request_stream_pool.popleft()
             stream.initiate_request()
-            self._write_to_transport()
 
     def pop_stream(self, stream_id: int) -> Stream:
         """Perform cleanup when a stream is closed
@@ -289,7 +290,7 @@ class H2ClientProtocol(Protocol, TimeoutMixin):
             self._conn_lost_deferred.callback(self._conn_lost_errors)
 
         for stream in self.streams.values():
-            if stream.request_sent:
+            if stream.metadata['request_sent']:
                 close_reason = StreamCloseReason.CONNECTION_LOST
             else:
                 close_reason = StreamCloseReason.INACTIVE
@@ -345,7 +346,11 @@ class H2ClientProtocol(Protocol, TimeoutMixin):
         self._send_pending_requests()
 
         # Update certificate when our HTTP/2 connection is established
-        self.metadata['certificate'] = Certificate(self.transport.getPeerCertificate())
+        try:
+            self.metadata['certificate'] = Certificate(self.transport.getPeerCertificate())
+        except AttributeError:
+            # Connection is made without SSL/TLS hence no getPeerCertificate() method available
+            pass
 
     def stream_ended(self, event: StreamEnded) -> None:
         stream = self.pop_stream(event.stream_id)
