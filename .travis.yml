@@ -4,6 +4,7 @@ branches:
   only:
     - master
     - http2  # ToDo: Remove once merged into master
+    - h2-client-protocol
     - /^\d\.\d+$/
     - /^\d\.\d+\.\d+(rc\d+|\.dev\d+)?$/
 matrix:
