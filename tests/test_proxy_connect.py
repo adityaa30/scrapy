@@ -4,8 +4,8 @@ import platform
 import re
 import sys
 from subprocess import Popen, PIPE
-from urllib.parse import urlsplit, urlunsplit
 from unittest import skipIf
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 from testfixtures import LogCapture
@@ -14,7 +14,6 @@ from twisted.trial.unittest import TestCase
 
 from scrapy.http import Request
 from scrapy.utils.test import get_crawler
-
 from tests.mockserver import MockServer
 from tests.spiders import SimpleSpider, SingleRequestSpider
 
@@ -65,6 +64,7 @@ def _wrong_credentials(proxy_url):
 @skipIf(platform.system() == 'Windows' and sys.version_info < (3, 7),
         "mitmproxy does not support Windows when running Python < 3.7")
 class ProxyConnectTestCase(TestCase):
+    settings_dict = None
 
     def setUp(self):
         self.mockserver = MockServer()
@@ -83,7 +83,7 @@ class ProxyConnectTestCase(TestCase):
 
     @defer.inlineCallbacks
     def test_https_connect_tunnel(self):
-        crawler = get_crawler(SimpleSpider)
+        crawler = get_crawler(SimpleSpider, self.settings_dict)
         with LogCapture() as log:
             yield crawler.crawl(self.mockserver.url("/status?n=200", is_secure=True))
         self._assert_got_response_code(200, log)
@@ -91,7 +91,7 @@ class ProxyConnectTestCase(TestCase):
     @pytest.mark.xfail(reason='Python 3.6+ fails this earlier', condition=sys.version_info >= (3, 6))
     @defer.inlineCallbacks
     def test_https_connect_tunnel_error(self):
-        crawler = get_crawler(SimpleSpider)
+        crawler = get_crawler(SimpleSpider, self.settings_dict)
         with LogCapture() as log:
             yield crawler.crawl("https://localhost:99999/status?n=200")
         self._assert_got_tunnel_error(log)
@@ -99,7 +99,7 @@ class ProxyConnectTestCase(TestCase):
     @defer.inlineCallbacks
     def test_https_tunnel_auth_error(self):
         os.environ['https_proxy'] = _wrong_credentials(os.environ['https_proxy'])
-        crawler = get_crawler(SimpleSpider)
+        crawler = get_crawler(SimpleSpider, self.settings_dict)
         with LogCapture() as log:
             yield crawler.crawl(self.mockserver.url("/status?n=200", is_secure=True))
         # The proxy returns a 407 error code but it does not reach the client;
@@ -109,7 +109,7 @@ class ProxyConnectTestCase(TestCase):
     @defer.inlineCallbacks
     def test_https_tunnel_without_leak_proxy_authorization_header(self):
         request = Request(self.mockserver.url("/echo", is_secure=True))
-        crawler = get_crawler(SingleRequestSpider)
+        crawler = get_crawler(SingleRequestSpider, self.settings_dict)
         with LogCapture() as log:
             yield crawler.crawl(seed=request)
         self._assert_got_response_code(200, log)
@@ -123,3 +123,11 @@ class ProxyConnectTestCase(TestCase):
     def _assert_got_tunnel_error(self, log):
         print(log)
         self.assertIn('TunnelError', str(log))
+
+
+class ProxyH2ConnectTestCase(ProxyConnectTestCase):
+    settings_dict = {
+        'DOWNLOAD_HANDLERS': {
+            'https': 'scrapy.core.downloader.handlers.http2.H2DownloadHandler'
+        }
+    }

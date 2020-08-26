@@ -1,19 +1,25 @@
 from collections import deque
-from typing import Deque, Dict, List, Tuple, Optional
 
 from twisted.internet import defer
 from twisted.internet.base import ReactorBase
 from twisted.internet.defer import Deferred
 from twisted.internet.endpoints import HostnameEndpoint
+from twisted.internet.tcp import Client
+from twisted.protocols.tls import TLSMemoryBIOFactory, TLSMemoryBIOProtocol
 from twisted.python.failure import Failure
-from twisted.web.client import URI, BrowserLikePolicyForHTTPS, _StandardEndpointFactory
+from twisted.web._newclient import HTTP11ClientProtocol, Request as TxRequest, Response as TxResponse
+from twisted.web.client import URI, BrowserLikePolicyForHTTPS, _HTTP11ClientFactory, _StandardEndpointFactory
 from twisted.web.error import SchemeNotSupported
+from twisted.web.http_headers import Headers as TxHeaders
+from typing import Deque, Dict, List, Tuple, Optional
 
 from scrapy.core.downloader.contextfactory import AcceptableProtocolsContextFactory
+from scrapy.core.downloader.handlers.http11 import TunnelError
 from scrapy.core.http2.protocol import H2ClientProtocol, H2ClientFactory
 from scrapy.http.request import Request
 from scrapy.settings import Settings
 from scrapy.spiders import Spider
+from scrapy.utils.python import to_bytes
 
 
 class H2ConnectionPool:
@@ -36,7 +42,13 @@ class H2ConnectionPool:
     def pending_connections(self) -> Dict[Tuple, Deque[Deferred]]:
         return self._pending_requests
 
-    def get_connection(self, key: Tuple, uri: URI, endpoint: HostnameEndpoint) -> Deferred:
+    def get_connection(
+        self,
+        key: Tuple, uri: URI,
+        endpoint: HostnameEndpoint,
+        context_factory: AcceptableProtocolsContextFactory,
+        connect_conf: Tuple = None
+    ) -> Deferred:
         if key in self._pending_requests:
             # Received a request while connecting to remote
             # Create a deferred which will fire with the H2ClientProtocol
@@ -52,16 +64,86 @@ class H2ConnectionPool:
             return defer.succeed(conn)
 
         # No connection is established for the given URI
-        return self._new_connection(key, uri, endpoint)
+        return self._new_connection(key, uri, endpoint, context_factory, connect_conf)
 
-    def _new_connection(self, key: Tuple, uri: URI, endpoint: HostnameEndpoint) -> Deferred:
+    def _tunnel_connect(
+        self,
+        uri: URI, endpoint: HostnameEndpoint,
+        context_factory: AcceptableProtocolsContextFactory,
+        connect_conf: Tuple, conn_lost_deferred: Deferred
+    ) -> Deferred:
+        """
+        Used to establish a SSL Tunnel via CONNECT. Follows the steps below:
+        1. Establishes a connection to endpoint via HTTP/1.1
+        2. Send CONNECT request
+        3. If Response to CONNECT request is 200 then go to 4 else raises TunnelError
+        4. Use the socket instance (transport) to create a H2ClientProtocol instance (proxy)
+
+        Arguments:
+            uri -- URI of the remote to which the HTTP/2 connection via proxy is made
+            endpoint -- Endpoint to the proxy to which HTTP/1.1 connection is made and
+                CONNECT request is sent
+            connect_conf -- Tuple having (proxy_host, proxy_port, proxy_auth), where proxy_auth is
+                the 'Proxy-Authorization' header
+
+        Returns:
+            Deferred which fires with the H2ClientProtocol instance
+            else calls the errback with TunnelError when CONNECT request
+            returns with status code != 200
+        """
+        proxy_host, proxy_port, proxy_auth = connect_conf
+        host_value = to_bytes(uri.host, encoding='ascii') + b':' + to_bytes(str(uri.port))
+
+        tunnel_d = Deferred()
+
+        def quiescent_callback(_):
+            """Called when CONNECT request is completed
+            No need to use this method"""
+            pass
+
+        def receive_connect_response(response: TxResponse, protocol: HTTP11ClientProtocol):
+            if response.code == 200:
+                assert isinstance(protocol.transport, Client)
+                ssl_options = context_factory.creatorForNetloc(uri.host, uri.port)
+                h2_protocol = H2ClientProtocol(uri, self.settings, conn_lost_deferred)
+                protocol.transport.startTLS(ssl_options)
+
+                tunnel_d.callback(h2_protocol)
+            else:
+                tunnel_d.errback(TunnelError(uri.host, uri.port, extra=response))
+
+        def send_connect_request(protocol: HTTP11ClientProtocol):
+            """Send CONNECT request"""
+            headers = TxHeaders({b'Host': [host_value]})
+            if proxy_auth:
+                headers.addRawHeader(b'Proxy-Authorization', to_bytes(proxy_auth))
+            response_d = protocol.request(TxRequest(b'CONNECT', host_value, headers, None))
+            response_d.addCallback(receive_connect_response, protocol)
+
+        factory = _HTTP11ClientFactory(quiescent_callback, repr(endpoint))
+        conn_d = endpoint.connect(factory)
+        conn_d.addCallback(send_connect_request)
+
+        return tunnel_d
+
+    def _new_connection(
+        self,
+        key: Tuple, uri: URI,
+        endpoint: HostnameEndpoint,
+        context_factory: AcceptableProtocolsContextFactory,
+        connect_conf: Tuple = None
+    ) -> Deferred:
         self._pending_requests[key] = deque()
 
         conn_lost_deferred = Deferred()
         conn_lost_deferred.addCallback(self._remove_connection, key)
 
-        factory = H2ClientFactory(uri, self.settings, conn_lost_deferred)
-        conn_d = endpoint.connect(factory)
+        if connect_conf:
+            conn_d = self._tunnel_connect(uri, endpoint, context_factory, connect_conf, conn_lost_deferred)
+        else:
+            factory = H2ClientFactory(uri, self.settings, conn_lost_deferred)
+            conn_d = endpoint.connect(factory)
+
         conn_d.addCallback(self.put_connection, key)
 
         d = Deferred()
@@ -114,6 +196,7 @@ class H2Agent:
             self._reactor, self._context_factory,
             connect_timeout, bind_address
         )
+        self.connect_conf = None
 
     def get_endpoint(self, uri: URI):
         return self.endpoint_factory.endpointForURI(uri)
@@ -133,7 +216,7 @@ class H2Agent:
             return defer.fail(Failure())
 
         key = self.get_key(uri)
-        d = self._pool.get_connection(key, uri, endpoint)
+        d = self._pool.get_connection(key, uri, endpoint, self._context_factory, self.connect_conf)
         d.addCallback(lambda conn: conn.request(request, spider))
         return d
 
@@ -160,3 +243,29 @@ class ScrapyProxyH2Agent(H2Agent):
     def get_key(self, uri: URI) -> Tuple:
         """We use the proxy uri instead of uri obtained from request url"""
         return "http-proxy", self._proxy_uri.host, self._proxy_uri.port
+
+
+class ScrapyTunnelingH2Agent(H2Agent):
+    def __init__(
+        self, reactor: ReactorBase,
+        proxy_uri: URI, proxy_conf: Tuple,
+        pool: H2ConnectionPool,
+        context_factory=BrowserLikePolicyForHTTPS(),
+        connect_timeout: Optional[float] = None, bind_address: Optional[bytes] = None
+    ) -> None:
+        super(ScrapyTunnelingH2Agent, self).__init__(
+            reactor=reactor,
+            pool=pool,
+            context_factory=context_factory,
+            connect_timeout=connect_timeout,
+            bind_address=bind_address
+        )
+        self.proxy_uri = proxy_uri
+        self.connect_conf = proxy_conf
+
+    def get_endpoint(self, uri: URI):
+        return self.endpoint_factory.endpointForURI(self.proxy_uri)
+
+    def get_key(self, uri: URI) -> Tuple:
+        key = super(ScrapyTunnelingH2Agent, self).get_key(uri)
+        return key + self.connect_conf
