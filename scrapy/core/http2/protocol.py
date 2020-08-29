@@ -15,6 +15,7 @@ from h2.events import (
 from h2.exceptions import H2Error
 from twisted.internet.defer import Deferred
 from twisted.internet.error import TimeoutError
+from twisted.internet.tcp import Client as TxClient
 from twisted.internet.interfaces import IHandshakeListener, IProtocolFactory, IProtocolNegotiationFactory
 from twisted.internet.protocol import connectionDone, Factory, Protocol
 from twisted.internet.ssl import Certificate
@@ -29,6 +30,7 @@ from scrapy.core.http2.types import H2ConnectionMetadataDict
 from scrapy.http import Request
 from scrapy.settings import Settings
 from scrapy.spiders import Spider
+from scrapy.utils.python import to_unicode
 
 logger = logging.getLogger(__name__)
 
@@ -217,9 +219,13 @@ class H2ClientProtocol(Protocol, TimeoutMixin):
     def handshakeCompleted(self):
         """We close the connection with InvalidNegotiatedProtocol exception
         when the connection was not made via h2 protocol"""
-        negotiated_protocol = self.transport.negotiatedProtocol
+        if isinstance(self.transport, TxClient):
+            negotiated_protocol = self.transport.protocol.negotiatedProtocol
+        else:
+            negotiated_protocol = self.transport.negotiatedProtocol
+
         if type(negotiated_protocol) is bytes:
-            negotiated_protocol = str(self.transport.negotiatedProtocol, 'utf-8')
+            negotiated_protocol = to_unicode(negotiated_protocol)
         if negotiated_protocol != 'h2':
             # Here we have not initiated the connection yet
             # So, no need to send a GOAWAY frame to the remote
