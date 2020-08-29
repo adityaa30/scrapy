@@ -1,17 +1,17 @@
 from collections import deque
+from typing import Deque, Dict, List, Tuple, Optional
 
 from twisted.internet import defer
 from twisted.internet.base import ReactorBase
 from twisted.internet.defer import Deferred
 from twisted.internet.endpoints import HostnameEndpoint
+from twisted.internet.protocol import Protocol
 from twisted.internet.tcp import Client
-from twisted.protocols.tls import TLSMemoryBIOFactory, TLSMemoryBIOProtocol
 from twisted.python.failure import Failure
 from twisted.web._newclient import HTTP11ClientProtocol, Request as TxRequest, Response as TxResponse
 from twisted.web.client import URI, BrowserLikePolicyForHTTPS, _HTTP11ClientFactory, _StandardEndpointFactory
 from twisted.web.error import SchemeNotSupported
 from twisted.web.http_headers import Headers as TxHeaders
-from typing import Deque, Dict, List, Tuple, Optional
 
 from scrapy.core.downloader.contextfactory import AcceptableProtocolsContextFactory
 from scrapy.core.downloader.handlers.http11 import TunnelError
@@ -20,6 +20,10 @@ from scrapy.http.request import Request
 from scrapy.settings import Settings
 from scrapy.spiders import Spider
 from scrapy.utils.python import to_bytes
+
+
+class EmptyResponseReceiver(Protocol):
+    pass
 
 
 class H2ConnectionPool:
@@ -99,16 +103,21 @@ class H2ConnectionPool:
         def quiescent_callback(_):
             """Called when CONNECT request is completed
             No need to use this method"""
-            pass
+            print(_)
 
-        def receive_connect_response(response: TxResponse, protocol: HTTP11ClientProtocol):
+        def receive_connect_response(response: TxResponse, protocol:    HTTP11ClientProtocol):
+            # FIXME: After response is received, protocol is in WAITING state (should be in QUIESCENT)
             if response.code == 200:
                 assert isinstance(protocol.transport, Client)
-                ssl_options = context_factory.creatorForNetloc(uri.host, uri.port)
                 h2_protocol = H2ClientProtocol(uri, self.settings, conn_lost_deferred)
-                protocol.transport.startTLS(ssl_options)
+                print(response.length)
+                response.deliverBody(EmptyResponseReceiver())
+                # ssl_options = context_factory.creatorForNetloc(uri.host, uri.port)
+                # protocol.transport.wrappedProtocol = h2_protocol
+                # h2_protocol.makeConnection(protocol.transport)
+                # protocol.transport.startTLS(ssl_options)
 
-                tunnel_d.callback(h2_protocol)
+                # tunnel_d.callback(h2_protocol)
             else:
                 tunnel_d.errback(TunnelError(uri.host, uri.port, extra=response))
 
