@@ -1,21 +1,21 @@
 import re
 from collections import deque
-from io import BytesIO
-from typing import Deque, Dict, List, Tuple, Optional
 
 from twisted.internet import defer
 from twisted.internet.base import ReactorBase
 from twisted.internet.defer import Deferred
 from twisted.internet.endpoints import HostnameEndpoint
 from twisted.internet.protocol import Protocol
-from twisted.internet.tcp import Client as TxClient
+from twisted.internet.tcp import Client
 from twisted.python.failure import Failure
-from twisted.web._newclient import HTTP11ClientProtocol
+from twisted.web._newclient import HTTP11ClientProtocol, Request as TxRequest, Response as TxResponse
 from twisted.web.client import URI, BrowserLikePolicyForHTTPS, _HTTP11ClientFactory, _StandardEndpointFactory
 from twisted.web.error import SchemeNotSupported
+from twisted.web.http_headers import Headers as TxHeaders
+from typing import Deque, Dict, List, Tuple, Optional
 
 from scrapy.core.downloader.contextfactory import AcceptableProtocolsContextFactory
-from scrapy.core.downloader.handlers.http11 import tunnel_request_data, TunnelError
+from scrapy.core.downloader.handlers.http11 import TunnelError
 from scrapy.core.http2.protocol import H2ClientProtocol, H2ClientFactory
 from scrapy.http.request import Request
 from scrapy.settings import Settings
@@ -97,8 +97,8 @@ class H2ConnectionPool:
             returns with status code != 200
         """
         proxy_host, proxy_port, proxy_auth = connect_conf
-        host_value = to_bytes(uri.host, encoding='ascii') + b':' + to_bytes(str(uri.port))
         response_regex = re.compile(br'HTTP/1\.. (?P<status>\d{3})(?P<reason>.{,32})')
+        host_value = to_bytes(uri.host, encoding='ascii') + b':' + to_bytes(str(uri.port))
 
         tunnel_d = Deferred()
 
@@ -107,45 +107,28 @@ class H2ConnectionPool:
             No need to use this method"""
             print(_)
 
-        connect_data_buffer = BytesIO()
-
-        def receive_connect_data(data: bytes, protocol: HTTP11ClientProtocol) -> None:
-            connect_data_buffer.write(data)
-            if b'\r\n\r\n' not in connect_data_buffer.getvalue():
-                return
-
-            response = response_regex.match(connect_data_buffer.getvalue())
-            if response and int(response.group('status')) == 200:
-                assert isinstance(protocol.transport, TxClient)
-
+        def receive_connect_response(response: TxResponse, protocol: HTTP11ClientProtocol):
+            # FIXME: After response is received, protocol is in WAITING state (should be in QUIESCENT)
+            if response.code == 200:
+                assert isinstance(protocol.transport, Client)
+                h2_protocol = H2ClientProtocol(uri, self.settings, conn_lost_deferred)
                 ssl_options = context_factory.creatorForNetloc(uri.host, uri.port)
+                protocol.transport.wrappedProtocol = h2_protocol
+                h2_protocol.makeConnection(protocol.transport)
                 protocol.transport.startTLS(ssl_options)
 
-                h2_protocol = H2ClientProtocol(uri, self.settings, conn_lost_deferred)
-                protocol.transport.protocol.wrappedProtocol = h2_protocol
-                h2_protocol.makeConnection(protocol.transport)
                 tunnel_d.callback(h2_protocol)
             else:
-                if response:
-                    extra = {
-                        'status': int(response.group('status')),
-                        'reason': response.group('reason').strip()
-                    }
-                else:
-                    extra = data[:32]
-                tunnel_d.errback(TunnelError(uri.host, uri.port, extra))
-
-            print(connect_data_buffer.getvalue())
+                tunnel_d.errback(TunnelError(uri.host, uri.port, extra=response))
 
         def send_connect_request(protocol: HTTP11ClientProtocol):
             """Send CONNECT request"""
-            request = tunnel_request_data(uri.host, uri.port, proxy_auth)
-            protocol.transport.write(request)
-
-            def data_received(data: bytes):
-                receive_connect_data(data, protocol)
-
-            protocol.dataReceived = data_received
+            headers = TxHeaders({b'Host': [host_value]})
+            if proxy_auth:
+                headers.addRawHeader(b'Proxy-Authorization', to_bytes(proxy_auth))
+            headers.addRawHeader(b'Proxy-Connection', b'Keep-Alive')
+            response_d = protocol.request(TxRequest(b'CONNECT', host_value, headers, None))
+            response_d.addCallback(receive_connect_response, protocol)
 
         factory = _HTTP11ClientFactory(quiescent_callback, repr(endpoint))
         conn_d = endpoint.connect(factory)
